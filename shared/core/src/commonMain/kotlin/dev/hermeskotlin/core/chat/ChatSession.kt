@@ -1516,9 +1516,22 @@ class ChatSession(
             it.copy(messages = it.messages + ChatMessage.User(key, trimmed, pending = true), keySeq = it.keySeq + 1, error = null)
         }
         val status = try {
+            // A session-authority gateway fences a correction by the running claim's
+            // `execution_generation` and answers `invalid_params` without it
+            // (gateway/session_busy_controls.py::correct), exactly as `session.interrupt` is
+            // fenced. Learn it first when this socket has not seen one yet, then send it; the
+            // legacy handlers need only `text`, so the key is left out when the value is
+            // genuinely unknown.
+            val targetId = if (executionGeneration == null && client.sessionAuthority && rowExists) {
+                attach(client, reconnected = true)
+            } else {
+                runtimeId
+            }
+            val generation = executionGeneration
             (client.request("session.steer", buildJsonObject {
-                put("session_id", runtimeId)
+                put("session_id", targetId)
                 put("text", trimmed)
+                generation?.let { put("execution_generation", it) }
             }) as? JsonObject).string("status")
         } catch (e: CancellationException) {
             throw e
@@ -2443,8 +2456,10 @@ class ChatSession(
         /** `session.steer`'s status for a steer the running turn took in. */
         const val STEER_ACCEPTED = "queued"
 
-        /** `session.steer` errors for a gateway that can't steer: no such method, or an agent without `steer()`. */
-        val STEER_UNSUPPORTED = setOf(METHOD_NOT_FOUND, 4010)
+        /** `session.steer` errors for a gateway that can't steer: no such method, or an agent without
+         * `steer()`, or a correction it refuses for this claim (`invalid_params` and
+         * `stale_generation` both arrive as JSON-RPC 4001). The text then goes as the next prompt. */
+        val STEER_UNSUPPORTED = setOf(METHOD_NOT_FOUND, 4010, INVALID_PARAMS)
 
         /** How long Stop & send waits for the stopped turn's `message.complete` before queueing behind it. */
         const val STOP_SETTLE_TIMEOUT_MS = 10_000L
@@ -2478,6 +2493,9 @@ class ChatSession(
 
         /** JSON-RPC "method not found": the gateway predates a call. */
         const val METHOD_NOT_FOUND = -32601
+
+        /** JSON-RPC "invalid params": also the wire code of the state authority's typed refusals. */
+        const val INVALID_PARAMS = 4001
 
         /** A REST read of a session the gateway no longer has. */
         const val HTTP_NOT_FOUND = 404
