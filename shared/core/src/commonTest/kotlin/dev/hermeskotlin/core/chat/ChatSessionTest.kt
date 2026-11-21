@@ -2586,6 +2586,37 @@ class ChatSessionTest {
         assertEquals(1, chat.state.first { it.messages.size == 1 }.messages.size)
     }
 
+    /**
+     * A prompt the gateway held behind a running turn (`queued`) is stored as its own row once its turn
+     * starts. The local bubble carried `queued`, which nothing else clears, so every later layout of the
+     * session showed it again beside the stored row — looking freshly sent. The layout must retire it.
+     */
+    @Test
+    fun aQueuedPromptIsntShownAgainOnceItsRowIsStored() = runTest {
+        val (chat, transport) = resumedChat(backgroundScope, mapOf("prompt.submit" to """{"status":"queued"}"""))
+
+        assertTrue(chat.send("use tabs", queue = true))
+        val queued = assertIs<ChatMessage.User>(chat.state.value.messages.last())
+        assertEquals("use tabs", queued.text)
+        assertTrue(queued.queued)
+
+        // Its turn starts and the gateway's transcript has the prompt.
+        history = """{"session_id":"stored-1","messages":[
+            {"id":1,"role":"user","content":"hello"},
+            {"id":2,"role":"assistant","content":"Hi! What next?"},
+            {"id":3,"role":"user","content":"use tabs"}]}"""
+        // The queued admission's own turn start, then a turn this chat didn't start: a foreign turn start is
+        // what reads the transcript again.
+        transport.push(event("message.start", "rt1"))
+        transport.push(event("message.start", "rt1"))
+        testScheduler.advanceUntilIdle()
+
+        val shown = chat.state.value.messages.filter { it.textOf() == "use tabs" }
+        assertEquals(listOf("hello", "Hi! What next?", "use tabs"), chat.state.value.messages.map { it.textOf() })
+        assertEquals(1, shown.size)
+        assertIs<ChatMessage.User>(shown.single())
+    }
+
     @Test
     fun aNewChatHasNoCheckpointsAndIsntCreatedForThem() = runTest {
         val (connection, transport) = setup(backgroundScope, emptyMap())

@@ -2212,9 +2212,19 @@ class ChatSession(
         val stored = historyToMessages(rows, rowsSessionId, startedAt).withRisks(flagged)
         // A prompt sent without a reply that the transcript now has arrived after all.
         val storedPrompts = stored.mapNotNullTo(HashSet()) { (it as? ChatMessage.User)?.text }
+        // Local bubbles the rows now carry are retired, not just hidden: one shown optimistically (`pending`),
+        // one the gateway held behind a running turn (`queued`), or one whose reply was lost (`check`). None of
+        // those flags is cleared anywhere else — `queued` has no clearing writer at all — so leaving them on a
+        // bubble made it reappear, looking freshly sent, on every later layout of this session (a re-layout
+        // keeps every local-only message). Each stored row retires one bubble, and the oldest bubble claims the
+        // oldest matching row, so the same text sent twice still keeps its second, not-yet-stored bubble.
+        val storedUsers = stored.mapNotNull { it as? ChatMessage.User }.toMutableList()
         // Only the gateway's transcript says a prompt arrived; the saved copy is from before it.
-        val unsettled = if (savedCopyAt != null) live else {
-            live.filterNot { it is ChatMessage.User && it.check != null && storedPrompts.any { p -> p.contains(it.text) } }
+        val unsettled = if (savedCopyAt != null) live else live.filterNot { message ->
+            val at = if (message !is ChatMessage.User) -1 else storedUsers.indexOfFirst { row ->
+                (message.rowId != null && row.rowId == message.rowId) || row.text.contains(message.text)
+            }
+            if (at < 0) false else { storedUsers.removeAt(at); true }
         }
         // Steps of the running turn are saved as it goes, and the live copy repeats them: show them once.
         val messages = (stored + unsettled).withSavedStepsFolded()
