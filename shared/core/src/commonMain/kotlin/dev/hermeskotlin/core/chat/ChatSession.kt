@@ -47,6 +47,8 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.putJsonArray
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.put
+import kotlin.uuid.ExperimentalUuidApi
+import kotlin.uuid.Uuid
 
 /**
  * One chat over the gateway, the way Hermes Desktop drives it: the stored transcript comes over REST,
@@ -1698,6 +1700,10 @@ class ChatSession(
     /**
      * Switches this chat's model. A new chat only remembers the pick for `session.create`; a live one
      * switches at once, or at the next turn when one is running. Pricey models ask to [confirm] first.
+     *
+     * A session-authority gateway takes the pick as `session.mutate` operation=model and refuses the legacy
+     * `config.set key=model` form; every other gateway answers that form. Both replies say whether a
+     * confirmation is needed, so the caller reads one shape either way.
      */
     suspend fun setModel(model: String, provider: String, confirm: Boolean = false): ModelSwitch {
         val previous = _state.value
@@ -1707,14 +1713,25 @@ class ChatSession(
         }
         _state.update { it.copy(model = model, provider = provider) }
         return try {
-            val result = // --session: a pick on the phone must not quietly rewrite the profile default (config.yaml).
-            configSet("model", JsonPrimitive("$model --provider $provider --session")) {
-                if (confirm) put("confirm_expensive_model", true)
+            val picked = ModelPick(model, provider)
+            val client = if (rowExists) connectedClient() else null
+            val result = if (client?.sessionAuthority == true) {
+                modelMutation(client, picked, confirm)
+            } else {
+                // --session: a pick on the phone must not quietly rewrite the profile default (config.yaml).
+                configSet("model", JsonPrimitive("$model --provider $provider --session")) {
+                    if (confirm) put("confirm_expensive_model", true)
+                }
             }
             if (result.boolean("confirm_required") == true) {
+                // A guarded target's token applies that exact pick only, so it waits beside it and is dropped
+                // by any other pick.
+                pendingModelConfirm = result.string("confirm")?.let { picked to it }
                 _state.update { it.copy(model = previous.model, provider = previous.provider) }
-                ModelSwitch.NeedsConfirmation(result.string("confirm_message") ?: "This model costs more than usual. Switch anyway?")
+                ModelSwitch.NeedsConfirmation(result.string("confirm_message") ?: result.string("message")
+                    ?: "This model costs more than usual. Switch anyway?")
             } else {
+                pendingModelConfirm = null
                 ModelSwitch.Done
             }
         } catch (e: CancellationException) {
@@ -1723,6 +1740,44 @@ class ChatSession(
             _state.update { it.copy(model = previous.model, provider = previous.provider, error = e.message ?: "Couldn't switch the model.") }
             ModelSwitch.Failed
         }
+    }
+
+    /** The pick a guarded target confirmed, and the token the gateway issued for it. */
+    private var pendingModelConfirm: Pair<ModelPick, String>? = null
+
+    /**
+     * The pick as a session-authority gateway takes it: `session.mutate` operation=model (gateway/
+     * session_mutations.py), fenced by the row's revision and generation read from `/api/sessions/{id}/
+     * mutation-snapshot`. That gateway refuses `config.set key=model` outright (`use_session_mutation_model`):
+     * a pick there is revision-fenced, retry-idempotent and selection-guarded, which a config write bypasses.
+     *
+     * A guarded (expensive) target answers `status: confirmation_required` with a `confirm` token that applies
+     * that exact pick only, so it goes back with the same model and provider it was issued for.
+     */
+    private suspend fun modelMutation(client: JsonRpcClient, picked: ModelPick, confirm: Boolean): JsonObject? {
+        val runtimeId = ensureAttached(client)
+        val counters = when (val read = sessions.mutationCounters(gateway, runtimeId, profile)) {
+            is ApiResult.Success -> read.value
+            else -> throw RpcException(0, "Couldn't read this chat's version from the gateway. Try again.")
+        }
+        // A model pick is a policy write: the authority refuses one that does not name the generation it acts on.
+        val generation = counters.generation ?: executionGeneration
+            ?: throw RpcException(0, "The gateway didn't say which version of the chat it has. Try again.")
+        return client.request(
+            "session.mutate",
+            buildJsonObject {
+                put("session_id", runtimeId)
+                put("request_id", newRequestId())
+                put("expected_revision", counters.revision)
+                put("expected_generation", generation)
+                put("operation", "model")
+                put("payload", buildJsonObject {
+                    put("model", picked.model)
+                    if (picked.provider.isNotBlank()) put("provider", picked.provider)
+                    if (confirm) pendingModelConfirm?.takeIf { it.first == picked }?.let { put("confirm", it.second) }
+                })
+            },
+        ) as? JsonObject
     }
 
     /** Sets the reasoning effort ([effort] `none` turns thinking off) for this chat only. */
@@ -2555,6 +2610,13 @@ data class StopAndSend(val outcome: SendOutcome, val dropped: List<String> = emp
 
 /** A prompt that came from a GPT-Live voice call; [context] is the recent spoken exchange, newest last. */
 data class VoiceLiveTurn(val context: String)
+
+/** The model and provider a pick names: what a mutation and its `confirm` token are keyed by. */
+private data class ModelPick(val model: String, val provider: String)
+
+/** A fresh `request_id`: the mutation's idempotency key, so a retry of the same pick applies once. */
+@OptIn(ExperimentalUuidApi::class)
+private fun newRequestId(): String = Uuid.random().toString()
 
 /** How [ChatSession.setModel] went. */
 sealed interface ModelSwitch {

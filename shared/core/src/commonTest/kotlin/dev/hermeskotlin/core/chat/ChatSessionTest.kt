@@ -17,6 +17,8 @@ import dev.hermeskotlin.core.rpc.json
 import dev.hermeskotlin.core.rpc.param
 import dev.hermeskotlin.core.sessions.SessionMessage
 import dev.hermeskotlin.core.sessions.SessionsApi
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import dev.hermeskotlin.core.slash.SlashCommand
 import io.ktor.client.engine.mock.respond
 import io.ktor.client.engine.mock.toByteArray
@@ -78,6 +80,8 @@ class ChatSessionTest {
             http = { request ->
                 val other = storedSessions.entries.firstOrNull { request.url.encodedPath == "/api/sessions/${it.key}/messages" }
                 when {
+                    request.url.encodedPath.endsWith("/mutation-snapshot") ->
+                        json("""{"exists":true,"runtime_revision":4,"runtime_generation":7}""")
                     other != null -> json(other.value)
                     request.url.encodedPath != "/api/sessions/stored-1/messages" -> error("unexpected ${request.url}")
                     historyFails -> json("{}", HttpStatusCode.InternalServerError)
@@ -867,6 +871,64 @@ class ChatSessionTest {
         transport.awaitSent { it.isCall("config.set") && it.param("key") == "reasoning" && it.param("value") == "low" }
         transport.push(event("session.info", "rt1", """{"model":"m1","reasoning_effort":"low","fast":false}"""))
         chat.state.first { it.reasoningEffort == "low" && it.fast == false }
+    }
+
+    @Test
+    fun aLiveChatOnASessionAuthoritySwitchesItsModelOverSessionMutate() = runTest {
+        val (connection, transport) = setup(
+            backgroundScope,
+            mapOf(
+                "session.resume" to """{"session_id":"rt1","running":false,"info":{"model":"m1","provider":"p1"}}""",
+                "session.mutate" to """{"status":"applied","model":"big"}""",
+            ),
+            ready = AUTHORITY_READY,
+        )
+        val chat = ChatSession(url, "stored-1", "Greeting", connection, SessionsApi(client()), backgroundScope)
+        chat.start()
+        chat.state.first { it.runtimeSessionId == "rt1" }
+
+        assertEquals(ModelSwitch.Done, chat.setModel("big", "p1"))
+        val params = transport.awaitSent { it.isCall("session.mutate") }["params"]!!.jsonObject
+        assertEquals("rt1", params["session_id"]!!.jsonPrimitive.content)
+        assertEquals("model", params["operation"]!!.jsonPrimitive.content)
+        // The fence comes from the row's own counters, not from a guess: the authority refuses a policy pick
+        // without the generation it acts on, and applies it once per revision.
+        assertEquals("4", params["expected_revision"]!!.jsonPrimitive.content)
+        assertEquals("7", params["expected_generation"]!!.jsonPrimitive.content)
+        val payload = params["payload"]!!.jsonObject
+        assertEquals("big", payload["model"]!!.jsonPrimitive.content)
+        assertEquals("p1", payload["provider"]!!.jsonPrimitive.content)
+        assertTrue(payload["confirm"] == null, "an unguarded pick carries no confirm token")
+        assertTrue(transport.sent.value.none { it.isCall("config.set") })
+        assertEquals("big", chat.state.value.model)
+    }
+
+    @Test
+    fun aGuardedPickOnASessionAuthorityConfirmsWithTheTokenItWasIssued() = runTest {
+        val (connection, transport) = setup(
+            backgroundScope,
+            mapOf(
+                "session.resume" to """{"session_id":"rt1","running":false,"info":{"model":"m1","provider":"p1"}}""",
+                "session.mutate" to """{"status":"confirmation_required","confirm_required":true,"confirm":"tok-1","message":"Costs a lot"}""",
+            ),
+            ready = AUTHORITY_READY,
+        )
+        val chat = ChatSession(url, "stored-1", "Greeting", connection, SessionsApi(client()), backgroundScope)
+        chat.start()
+        chat.state.first { it.runtimeSessionId == "rt1" }
+
+        assertEquals(ModelSwitch.NeedsConfirmation("Costs a lot"), chat.setModel("big", "p1"))
+        assertEquals("m1", chat.state.value.model)   // rolled back until the user says yes
+
+        gateway.answer = { """{"status":"applied","model":"big"}""" }
+        assertEquals(ModelSwitch.Done, chat.setModel("big", "p1", confirm = true))
+        val picks = transport.sent.value.filter { it.isCall("session.mutate") }
+        assertEquals(2, picks.size)
+        assertTrue(picks.first()["params"]!!.jsonObject["payload"]!!.jsonObject["confirm"] == null)
+        assertEquals(
+            "tok-1",
+            picks.last()["params"]!!.jsonObject["payload"]!!.jsonObject["confirm"]!!.jsonPrimitive.content,
+        )
     }
 
     @Test

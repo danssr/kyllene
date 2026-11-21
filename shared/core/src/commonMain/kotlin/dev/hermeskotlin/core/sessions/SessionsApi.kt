@@ -34,7 +34,7 @@ private data class SessionPatch(
 
 /** `GET /api/sessions/{id}/mutation-snapshot`: the counters a write to the row must name. */
 @Serializable
-private data class MutationSnapshot(
+data class SessionMutationCounters(
     val exists: Boolean = false,
     @SerialName("runtime_revision") val revision: Long = 0,
     @SerialName("runtime_generation") val generation: Long? = null,
@@ -125,6 +125,22 @@ class SessionsApi(private val client: HttpClient) {
         }
     }.map { it.body<SessionTotals>() }
 
+    /**
+     * The counters a write must name: the row's revision and generation, as the gateway exposes them for its
+     * own writes above. A *socket* write needs them too — a session-authority gateway fences `session.mutate`
+     * by revision and refuses a policy pick without the generation — and a live chat's row has no REST write
+     * path to read them through (`ChatSession.setModel`).
+     */
+    suspend fun mutationCounters(
+        url: GatewayUrl,
+        sessionId: String,
+        profile: String? = null,
+    ): ApiResult<SessionMutationCounters> = apiCall {
+        client.get(url.resolve("api/sessions/${sessionId.encodeURLPathPart()}/mutation-snapshot")) {
+            profile?.let { parameter("profile", it) }
+        }
+    }.map { it.body<SessionMutationCounters>() }
+
     /** Sets a title; an empty [title] clears it. Titles are unique per profile, so a clash is a 400 with a message. */
     suspend fun rename(url: GatewayUrl, sessionId: String, title: String, profile: String? = null): ApiResult<Unit> =
         patch(url, sessionId, SessionPatch(title = title, profile = profile))
@@ -206,7 +222,7 @@ class SessionsApi(private val client: HttpClient) {
                 snapshot.isMissingRoute() -> null
                 snapshot !is ApiResult.Success -> return snapshot.map { }.inWords()
                 snapshot.value.contentType()?.match(ContentType.Application.Json) != true -> null
-                else -> when (val read = snapshot.map { it.body<MutationSnapshot>() }) {
+                else -> when (val read = snapshot.map { it.body<SessionMutationCounters>() }) {
                     is ApiResult.Success -> {
                         if (!read.value.exists) return gone
                         val generation = read.value.generation
